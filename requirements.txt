@@ -1,0 +1,14 @@
+diffusers
+transformers
+accelerate
+opencv-python
+numpy
+Pillow
+matplotlib
+tqdm
+requests
+ollama
+fastapi
+uvicorn
+python-multipart
+scikit-image
