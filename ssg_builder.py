@@ -73,7 +73,7 @@ class SSGBuilder:
 
     def build_graph(self, tex_map, light_map, bound_map):
         """
-        Builds the adaptive Huffman hierarchy using spatial coverage and saliency priorities.
+        Builds the adaptive Spectral hierarchy using spatial coverage and saliency priorities.
         Node IDs are spatially stable: leaf_<x>_<y> so they survive pixel edits.
         """
         B = bound_map.size(0)
