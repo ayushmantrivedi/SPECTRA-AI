@@ -67,10 +67,16 @@ class KernelDiffusionModule:
         )
 
         if is_cuda:
-            print("[KernelDiffusion] VRAM SAFETY: Using Model Offload + Attention Slicing + VAE Tiling")
-            self.inpaint_pipeline.enable_model_cpu_offload()
-            self.inpaint_pipeline.enable_attention_slicing()
-            self.inpaint_pipeline.vae.enable_tiling()
+            # Check for High-VRAM environment (e.g. Google Colab T4)
+            if os.environ.get("SPECTRA_FULL_GPU") == "1":
+                print("[KernelDiffusion] VRAM PERFORMANCE: Using Full GPU Load (16GB+ Detected)")
+                self.inpaint_pipeline.to(self.device)
+                self.inpaint_pipeline.vae.enable_tiling()
+            else:
+                print("[KernelDiffusion] VRAM SAFETY: Using Model Offload + Attention Slicing + VAE Tiling")
+                self.inpaint_pipeline.enable_model_cpu_offload()
+                self.inpaint_pipeline.enable_attention_slicing()
+                self.inpaint_pipeline.vae.enable_tiling()
         else:
             self.inpaint_pipeline.to(self.device)
 
