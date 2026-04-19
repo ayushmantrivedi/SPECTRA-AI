@@ -78,7 +78,7 @@ class DynamicOrchestrator:
         
         # Initial state extraction
         with torch.no_grad():
-            current_ssg_dict, masks_cache_new = self.model.extract_ssg(current_img)
+            current_ssg_dict, masks_cache_new, base_features = self.model.extract_ssg(current_img)
             # Merge caches if needed
             if masks_cache is None: 
                 masks_cache = masks_cache_new
@@ -110,16 +110,16 @@ class DynamicOrchestrator:
 
             self.ssg_tracker.record_edit(resolved_id)
             
-            # Execute Diffusion
+            # Execute Diffusion with active base features
             current_img = self.diffusion_module.run_diffusion_edit(
-                current_img, None, resolved_id, influence, mask_tensor
+                current_img, base_features, resolved_id, influence, mask_tensor
             )
             
             exec_log.append(f"Hop {step+1}: {resolved_id} edited.")
             
-            # Re-extract for next hop
+            # Re-extract SSG AFTER the edit so subsequent hops see updated image
             with torch.no_grad():
-                current_ssg_dict, masks_cache = self.model.extract_ssg(current_img)
+                current_ssg_dict, masks_cache, base_features = self.model.extract_ssg(current_img)
 
         final_ssg = self.ssg_tracker.update_weights(current_ssg_dict)
         return current_img, final_ssg, exec_log

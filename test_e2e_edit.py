@@ -47,7 +47,7 @@ def main():
 
     # 2. Extract
     print("[+] Extracting Spectral Semantic Graph...")
-    ssg_dict, masks_cache = model.extract_ssg(img_pil)
+    ssg_dict, masks_cache, features = model.extract_ssg(img_pil)
     print_ssg_tree(ssg_dict)
 
     # 3. Parse

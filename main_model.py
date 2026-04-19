@@ -651,7 +651,7 @@ class ImageGenerationModel(nn.Module):
         # Ensure SCENE_ROOT exists for global edits
         masks["SCENE_ROOT"] = torch.ones(input_tensor.shape[2], input_tensor.shape[3], device=input_tensor.device)
         
-        return ssg_root, masks
+        return ssg_root, masks, (zt, zl, zb)
         
     def generate_from_features(self, z_texture, z_light, z_boundary, noise=None, use_turboquant=True):
         """Generate image from extracted features"""
