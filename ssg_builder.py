@@ -55,8 +55,8 @@ def union_bbox(b1, b2):
     return [int(x1), int(y1), int(max(1, x2 - x1)), int(max(1, y2 - y1))]
 
 
-class HSGBuilder:
-    """Constructs the Huffman Scene Graph structure bottom-up."""
+class SSGBuilder:
+    """Constructs the Spectral Semantic Graph structure bottom-up."""
 
     def __init__(self, threshold=0.5):
         self.threshold = threshold
