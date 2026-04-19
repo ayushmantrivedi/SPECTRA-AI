@@ -582,84 +582,76 @@ class ImageGenerationModel(nn.Module):
     def extract_ssg(self, image_pil):
         """
         Extract Spectral Semantic Graph (SSG) JSON and binary masks directly from image.
-        Optionally uses CLIPSeg for semantic enrichment.
+        Uses CLIPSeg for semantic enrichment.
         """
         self._load_features()
-        zt, zl, zb, (tex_map, light_map, bound_map) = self.feature_extractor(image)
         
-        # 4. Hierarchical spectral construction
-        root_node = self.ssg_builder.build_hierarchy(semantic_masks, saliency)
-        ssg_json = root_node.to_dict()
+        # 1. Image preprocessing for feature extractor
+        if not torch.is_tensor(image_pil):
+            from torchvision import transforms as T
+            transform = T.Compose([T.Resize((128, 128)), T.ToTensor()])
+            input_tensor = transform(image_pil).unsqueeze(0).to(device)
+        else:
+            input_tensor = image_pil
 
-        return ssg_json, semantic_masks
+        # 2. Extract Latent Features
+        zt, zl, zb, (tex_map, light_map, bound_map) = self.feature_extractor(input_tensor)
         
-        # Purge basic features ASAP to save RAM for CLIPSeg
-        self.purge_features()
+        # 3. Base Structural Construction via SSG Builder
+        # (Assuming build_graph exists as per prev refactor)
+        res_ssg_list, res_masks_list = self.ssg_builder.build_graph(tex_map, light_map, bound_map)
+        ssg_root = res_ssg_list[0]
+        masks = res_masks_list[0]
 
-        # Semantic Enrichment with CLIPSeg
-        if CLIPSegProcessor is not None:
-            # Convert map/tensor to PIL for CLIPSeg
-            pil_img = transforms.ToPILImage()(image[0].cpu())
-            semantic_masks = self.segmenter.segment(pil_img, semantic_prompts)
-
-            semantic_nodes = []  # Will be injected as top-level children in HSG
+        # 4. Semantic Enrichment with CLIPSeg
+        self.purge_features() # Free RAM
+        
+        semantic_prompts = ["person", "hair", "face", "clothing", "upper body", "eyes", "mouth", "background", "sky", "grass"]
+        
+        if self.segmenter is not None:
+            # Convert to PIL for segmenter
+            if torch.is_tensor(input_tensor):
+                from torchvision import transforms as T2
+                pil_for_seg = T2.ToPILImage()(input_tensor[0].cpu())
+            else:
+                pil_for_seg = image_pil
+                
+            semantic_masks = self.segmenter.segment(pil_for_seg, semantic_prompts)
+            
             if semantic_masks is not None:
-                H_img = image.shape[2]
-                W_img = image.shape[3]
+                H_img, W_img = input_tensor.shape[2], input_tensor.shape[3]
                 total_px = float(H_img * W_img)
+                semantic_nodes = []
 
                 for i, label in enumerate(semantic_prompts):
-                    s_mask = (semantic_masks[i, 0] > 0.25).float() # Binarize with safe threshold
-                    s_key  = f"semantic_{label}"
-                    masks[s_key] = s_mask
-
-                    # Only surface nodes with meaningful coverage
-                    coverage = float(s_mask.sum()) / total_px
-                    if coverage < 0.02:     # < 2% of image → skip
-                        continue
-
-                    # Compute tight bbox from mask
-                    ys, xs = torch.where(s_mask > 0.3)
-                    if len(ys) == 0:
-                        continue
-                    x0, y0 = int(xs.min()), int(ys.min())
-                    x1, y1 = int(xs.max()), int(ys.max())
-
-                    size_tag = ("massive" if coverage > 0.25 else
-                                "large"   if coverage > 0.10 else "medium")
-
-                    semantic_nodes.append({
-                        "id":     s_key,
-                        "weight": round(coverage, 4),
-                        "depth":  1,
-                        "bbox":   [x0, y0, x1 - x0, y1 - y0],
-                        "attributes": {
-                            "size":     size_tag,
-                            "location": "center",
-                            "semantic": True,
-                            "label":    label,
-                            "coverage_pct": round(coverage * 100, 1)
-                        },
-                        "children": []
-                    })
-
-            # Inject semantic nodes as HIGH-PRIORITY children of SCENE_ROOT
-            # so the LLM always sees them at the top of the tree
-            if semantic_nodes:
-                semantic_nodes.sort(key=lambda n: n["weight"], reverse=True)
-                hsg_root.setdefault("children", [])
-                hsg_root["children"] = semantic_nodes + hsg_root["children"]
-                print(f"[HSG] Injected {len(semantic_nodes)} semantic nodes into tree: "
-                      f"{[n['id'] for n in semantic_nodes]}")
-
-            # Always add a SCENE_ROOT full-image mask so "edit everything" works
-            masks["SCENE_ROOT"] = torch.ones(
-                image.shape[2], image.shape[3], device=image.device)
-
-            # Explicit Unload to save RAM for Ollama/Diffusion
-            self.segmenter.unload_model()
-
-        return hsg_root, masks, (zt, zl, zb)
+                    mask_val = (semantic_masks[i, 0] > 0.25).float()
+                    coverage = float(mask_val.sum()) / total_px
+                    
+                    if coverage > 0.01: # 1% threshold
+                        s_key = f"semantic_{label}"
+                        masks[s_key] = mask_val
+                        
+                        # BBox extraction
+                        ys, xs = torch.where(mask_val > 0.3)
+                        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+                        
+                        semantic_nodes.append({
+                            "id": s_key,
+                            "weight": round(coverage, 4),
+                            "depth": 1,
+                            "bbox": [x0, y0, x1 - x0, y1 - y0],
+                            "attributes": {"label": label, "semantic": True},
+                            "children": []
+                        })
+                
+                # Inject into SSG Root
+                ssg_root.setdefault("children", [])
+                ssg_root["children"] = semantic_nodes + ssg_root["children"]
+        
+        # Ensure SCENE_ROOT exists for global edits
+        masks["SCENE_ROOT"] = torch.ones(input_tensor.shape[2], input_tensor.shape[3], device=input_tensor.device)
+        
+        return ssg_root, masks
         
     def generate_from_features(self, z_texture, z_light, z_boundary, noise=None, use_turboquant=True):
         """Generate image from extracted features"""
