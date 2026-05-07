@@ -1,0 +1,20 @@
+model:
+  vision_backbone: "dinov2-large"
+  orchestrator_vlm: "gemini-2.5-pro-preview-05-06"
+  nlp_parser: "phi3:mini"
+  diffusion_engine: "runwayml/stable-diffusion-inpainting"
+  quantization: "INT8"
+
+hardware:
+  target_vram_gb: 4
+  target_ram_gb: 16
+  device: "auto"
+
+thresholds:
+  target_accuracy_min: 0.80
+  frozen_ssim_min: 0.96
+  frozen_cosine_min: 0.93
+  visual_consistency_min: 0.75
+  artifact_score_max: 0.15
+  fulfillment_confidence: 0.82
+  overall_pass_min: 0.80

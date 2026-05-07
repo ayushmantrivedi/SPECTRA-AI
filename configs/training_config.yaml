@@ -1,0 +1,24 @@
+training:
+  batch_size: 16
+  learning_rate: 2e-4
+  optimizer: "AdamW"
+  weight_decay: 0.01
+
+phases:
+  color_head:
+    iterations: 50000
+    dataset: "adobe_color"
+  edge_head:
+    iterations: 50000
+    dataset: "bsds500"
+  texture_head:
+    iterations: 50000
+    dataset: "dtd"
+  fusion_module:
+    iterations: 100000
+    dataset: "coco_panoptic"
+  hsg_construction:
+    iterations: 200000
+    dataset: "synthetic_hsg_pairs"
+
+seed: 42

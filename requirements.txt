@@ -12,3 +12,5 @@ fastapi
 uvicorn
 python-multipart
 scikit-image
+google-generativeai
+pydantic
