@@ -383,13 +383,22 @@ class OrchestratorVLM:
             return []
 
         try:
-            resized = img.resize((224, 224))
+            # Let the processor handle resizing, but force 224x224 if it defaults to 352
             inputs = self._clipseg_processor(
                 text=self.SEMANTIC_PROMPTS,
-                images=[resized] * len(self.SEMANTIC_PROMPTS),
+                images=[img] * len(self.SEMANTIC_PROMPTS),
                 padding=True,
                 return_tensors="pt",
-            ).to(self.device)
+            )
+            
+            if inputs.pixel_values.shape[-1] != 224:
+                # Force resize to 224 if the processor defaults to 352 but model wants 224
+                inputs.pixel_values = F.interpolate(
+                    inputs.pixel_values, size=(224, 224), 
+                    mode="bilinear", align_corners=False
+                )
+            
+            inputs = inputs.to(self.device)
 
             with torch.no_grad():
                 outputs = self._clipseg_model(**inputs)

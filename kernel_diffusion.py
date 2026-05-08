@@ -117,9 +117,15 @@ class KernelDiffusionModule:
     @staticmethod
     def dilate_mask(mask_tensor, kernel_size=31):
         """
-        Morphological dilation of a binary mask tensor [1,1,H,W].
+        Morphological dilation of a binary mask tensor.
         Ensures small semantic regions are covered with a generous inpainting area.
         """
+        # Ensure 4D [1, 1, H, W] for conv2d
+        if mask_tensor.dim() == 2:
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+        elif mask_tensor.dim() == 3:
+            mask_tensor = mask_tensor.unsqueeze(0)
+            
         k = torch.ones(1, 1, kernel_size, kernel_size, device=mask_tensor.device)
         pad = kernel_size // 2
         dilated = torch.clamp(F.conv2d(mask_tensor.float(), k, padding=pad), 0, 1)
@@ -202,13 +208,13 @@ class KernelDiffusionModule:
                            influence, mask_tensor):
         """
         Primary editing entry point.
-
-        Routing:
-          - If 'intent' in influence AND mask coverage >= 2%:
-              → SD inpainting at 512×512 with dilated mask
-          - Otherwise:
-              → pixel-space deterministic edit (fallback, always visible)
         """
+        # Ensure mask_tensor is 4D [1, 1, H, W]
+        if mask_tensor.dim() == 2:
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+        elif mask_tensor.dim() == 3:
+            mask_tensor = mask_tensor.unsqueeze(0)
+            
         zt_base, zl_base, zb_base = base_features
 
         # CTO Hardening: LBT Synchronization (Hand-in-Hand Editing)
@@ -250,6 +256,10 @@ class KernelDiffusionModule:
             self.load_pipeline()
             print(f"[KernelDiffusion] SD Inpainting | mask coverage: "
                   f"{mask_coverage*100:.1f}% | node: {target_node}")
+
+            # Ensure full_img is a tensor (B, C, H, W)
+            if not torch.is_tensor(full_img):
+                full_img = TF.to_tensor(full_img).unsqueeze(0).to(self.device)
 
             H_orig, W_orig = full_img.shape[2], full_img.shape[3]
 
