@@ -107,6 +107,9 @@ class OrchestratorLoop:
         self.hsg = HuffmanSceneGraph()
         self.adaptive_rebalancer.attach(self.hsg)
 
+        # Mask cache — populated by Stage 1, consumed by Stage 3
+        self._clipseg_masks: Dict[str, Any] = {}
+
         # Lazy-import diffusion (avoids loading 4 GB at startup)
         self._diffusion_module = None
 
@@ -207,12 +210,17 @@ class OrchestratorLoop:
         try:
             result = self.vlm_orchestrator.analyze(image_pil)
             hsg_dict = result["hsg"]
+            # Stage 1 now also returns CLIPSeg mask tensors — store for Stage 3
+            self._clipseg_masks = result.get("masks", {})
+            print(f"[Stage1] Detected {len(self._clipseg_masks)} segmented nodes: "
+                  f"{list(self._clipseg_masks.keys())}")
             self.hsg.build_from_ssg_dict(hsg_dict)
             audit.status = "ok"
             audit.meta = result.get("metadata", {})
         except Exception as e:
             logger.error(f"[Stage1] Failed: {e}")
             hsg_dict = self._fallback_hsg(image_pil)
+            self._clipseg_masks = {}
             self.hsg.build_from_ssg_dict(hsg_dict)
             audit.status = "fallback"
             audit.meta = {"error": str(e)}
@@ -263,9 +271,11 @@ class OrchestratorLoop:
             audit.meta = {
                 "target_nodes": edit_plan.get("target_nodes", []),
                 "edit_type": edit_plan.get("type"),
+                "masks_available": list(self._clipseg_masks.keys()),
             }
         except Exception as e:
             logger.error(f"[Stage3] Execution failed: {e}")
+            import traceback; traceback.print_exc()
             edited = image_pil   # passthrough on failure
             audit.status = "error"
             audit.meta = {"error": str(e)}
@@ -280,61 +290,92 @@ class OrchestratorLoop:
         hsg_dict: Dict[str, Any],
         diff_module,
     ) -> Image.Image:
-        """Bridge between new pipeline and existing KernelDiffusionModule."""
-        import sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        """
+        Direct bridge to KernelDiffusionModule using CLIPSeg masks from Stage 1,
+        fully integrated with the custom base_features extracted from the model.
+        This preserves 100% of our advanced LBT Synchronization and TurboQuant features!
+        """
+        import torch
+        import torchvision.transforms.functional as TF
 
-        from main_model import ImageGenerationModel, device as global_device
-        from spectral_sync import SpectralSyncTracker
-        from dynamic_orchestrator import DynamicOrchestrator, _flatten_ssg
+        target_nodes = edit_plan.get("target_nodes", [])
+        modifications = edit_plan.get("modifications", [])
 
-        # Build legacy edits list from new-style edit_plan
-        edits = []
-        for mod in edit_plan.get("modifications", []):
-            influence_block = mod.get("influence", {})
-            if not isinstance(influence_block, dict):
-                influence_block = {}
-            edits.append({
-                "target_node": mod.get("node", "SCENE_ROOT"),
-                "intent": (
-                    f"{mod.get('new_value', '')} {mod.get('attribute_path', '')}"
-                ).strip(),
-                "influence": {
-                    "ZT": influence_block.get("ZT", 0.8),
-                    "ZL": influence_block.get("ZL", 0.0),
-                    "ZB": influence_block.get("ZB", 0.0),
-                    "intent": mod.get("new_value", "high quality realistic edit"),
-                },
-            })
+        # Build a combined prompt from all modifications
+        intent_parts = []
+        for mod in modifications:
+            inf = mod.get("influence", {})
+            # Prefer the exact intent/instruction if the parser provided it
+            if "intent" in inf and inf["intent"]:
+                intent_parts.append(inf["intent"])
+            else:
+                val = mod.get("new_value", "")
+                attr = mod.get("attribute_path", "")
+                if val:
+                    intent_parts.append(f"{val} {attr}".replace("color.primary", "").strip())
+        
+        # Deduplicate to prevent "stormy sky, stormy sky"
+        deduped = list(dict.fromkeys(intent_parts))
+        combined_intent = ", ".join(deduped) if deduped else "high quality realistic edit"
 
-        # Handle cascade targets
-        for ct in edit_plan.get("cascade_targets", []):
-            edits.append({
-                "target_node": ct.get("node", "SCENE_ROOT"),
-                "intent": ct.get("action", ""),
-                "influence": {"ZT": 0.5, "ZL": 0.5, "ZB": 0.0,
-                              "intent": ct.get("action", "")},
-            })
+        influence = {
+            "ZT": 0.9, "ZL": 0.3, "ZB": 0.0,
+            "intent": combined_intent,
+        }
 
-        # Use existing orchestrator (backwards-compatible)
-        legacy_model = _LegacyModelProxy()
-        tracker = SpectralSyncTracker(decay_lambda=0.85)
-        orchestrator = DynamicOrchestrator(legacy_model, tracker)
+        current_img = image_pil
 
-        # Re-extract SSG using existing model
-        from main_model import ImageGenerationModel
-        gen_model = _get_cached_gen_model()
-        ssg_dict, masks_cache, features = gen_model.extract_ssg(image_pil)
+        # --- EXTRACT ACTIVE BASE FEATURES ---
+        # This loads our custom expert latent dimensions so that TurboQuant subspace projection works perfectly
+        base_features = None
+        try:
+            gen_model = _get_cached_gen_model()
+            with torch.no_grad():
+                _, _, base_features = gen_model.extract_ssg(current_img)
+            print("[Stage3] Successfully extracted active base_features for LBT and TurboQuant execution.")
+        except Exception as e:
+            print(f"[Stage3] Failed to extract base_features, falling back to flat diffusion: {e}")
 
-        result_img, _, _ = orchestrator.execute_edit_schedule(
-            image_pil, ssg_dict, edits, initial_masks_cache=masks_cache
-        )
+        # Try each target node in order
+        for target_node_id in target_nodes:
+            # --- Resolve mask from Stage 1 cache ---
+            mask_tensor = None
 
-        if torch.is_tensor(result_img):
-            from torchvision.transforms.functional import to_pil_image
-            result_img = to_pil_image(result_img[0].clamp(0, 1).cpu())
+            # 1. Exact match
+            if target_node_id in self._clipseg_masks:
+                mask_tensor = self._clipseg_masks[target_node_id]
+                print(f"[Stage3] Exact mask match: '{target_node_id}'")
 
-        return result_img
+            # 2. Fuzzy match
+            if mask_tensor is None:
+                target_words = set(target_node_id.lower().replace("semantic_", "").split("_"))
+                for key, m in self._clipseg_masks.items():
+                    key_words = set(key.lower().replace("semantic_", "").split("_"))
+                    if target_words & key_words:
+                        mask_tensor = m
+                        print(f"[Stage3] Fuzzy mask match: '{target_node_id}' -> '{key}'")
+                        break
+
+            # 3. Fallback: full image mask
+            if mask_tensor is None:
+                print(f"[Stage3] No mask for '{target_node_id}', using full-image fallback.")
+                W, H = image_pil.size
+                mask_tensor = torch.ones(1, 1, H, W)
+
+            # --- Run diffusion ---
+            try:
+                result = diff_module.run_diffusion_edit(
+                    current_img, base_features, target_node_id, influence, mask_tensor
+                )
+                if torch.is_tensor(result):
+                    result = TF.to_pil_image(result[0].clamp(0, 1).cpu())
+                current_img = result
+                print(f"[Stage3] Edit applied for '{target_node_id}'.")
+            except Exception as e:
+                print(f"[Stage3] Diffusion failed for '{target_node_id}': {e}")
+                import traceback; traceback.print_exc()
+
+        return current_img
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────
 

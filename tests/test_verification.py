@@ -1,22 +1,28 @@
-import os
-import sys
-from PIL import Image
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
+import pytest
 from spectra_core.verification_engine import VerificationEngine
 
-def test_heuristic_fulfillment():
-    ve = VerificationEngine(device="cpu")
-    # Simulate a parsed plan
-    plan = {
-        "confidence": 0.8,
-        "type": "SINGLE_NODE"
-    }
+def test_verification_engine_init():
+    engine = VerificationEngine()
+    assert engine is not None
+
+def test_target_accuracy_check():
+    engine = VerificationEngine()
     
-    # We can pass dummy images since the heuristic fulfillment doesn't use them
-    dummy_img = Image.new("RGB", (100, 100))
-    res = ve._check_instruction_fulfillment(dummy_img, plan)
+    # Mock HSG data
+    original_hsg = {"nodes": {"hat": {"attributes": {"color": "blue"}}}}
+    edited_hsg = {"nodes": {"hat": {"attributes": {"color": "red"}}}}
+    edit_plan = {"modifications": [{"node": "hat", "attribute_path": "color", "new_value": "red"}]}
     
-    assert res.status == "PASS"
-    assert res.confidence == 0.8
+    check_result = engine._check_target_accuracy(original_hsg, edited_hsg, edit_plan)
+    assert check_result["status"] == "PASS"
+
+def test_target_accuracy_fail():
+    engine = VerificationEngine()
+    
+    # Mock HSG data
+    original_hsg = {"nodes": {"hat": {"attributes": {"color": "blue"}}}}
+    edited_hsg = {"nodes": {"hat": {"attributes": {"color": "blue"}}}}
+    edit_plan = {"modifications": [{"node": "hat", "attribute_path": "color", "new_value": "red"}]}
+    
+    check_result = engine._check_target_accuracy(original_hsg, edited_hsg, edit_plan)
+    assert check_result["status"] == "FAIL"

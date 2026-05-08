@@ -1,53 +1,34 @@
-import os
-import sys
+import pytest
+from spectra_core.huffman_graph import HuffmanSceneGraph, AdaptiveRebalancer
 
-# Ensure root path is accessible
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from spectra_core.huffman_graph import HuffmanSceneGraph
-
-def test_hsg_creation():
+def test_hsg_initialization():
     hsg = HuffmanSceneGraph()
-    # Test simple scene dict
-    scene_dict = {
-        "id": "SCENE_ROOT",
-        "weight": 1.0,
-        "children": [
-            {"id": "person_1", "weight": 0.9, "children": []},
-            {"id": "bg", "weight": 0.3, "children": []}
-        ]
-    }
-    hsg.build_from_orchestrator_output(scene_dict)
-    
-    # Root should exist
+    assert hsg.root is not None
     assert hsg.root.id == "SCENE_ROOT"
     assert hsg.root.weight == 1.0
-    
-    # Children should be sorted by weight
-    assert len(hsg.root.children) == 2
-    assert hsg.root.children[0].id == "person_1"
-    assert hsg.root.children[1].id == "bg"
 
-def test_hsg_adaptive_rebalance():
+def test_add_and_retrieve_node():
     hsg = HuffmanSceneGraph()
-    scene_dict = {
-        "id": "SCENE_ROOT",
-        "weight": 1.0,
-        "children": [
-            {"id": "person_1", "weight": 0.9, "children": []},
-            {"id": "bg", "weight": 0.3, "children": []}
-        ]
-    }
-    hsg.build_from_orchestrator_output(scene_dict)
+    hsg.add_node("person_01", "person", parent_id="SCENE_ROOT", attributes={"color": "red"})
     
-    # Simulate editing the background multiple times
-    hsg.record_edit("bg", decay_lambda=0.5)
-    hsg.record_edit("bg", decay_lambda=0.5)
-    hsg.record_edit("bg", decay_lambda=0.5)
+    node = hsg.get_node("person_01")
+    assert node is not None
+    assert node.label == "person"
+    assert node.attributes["color"] == "red"
+    assert node.parent == hsg.root
+
+def test_adaptive_rebalancer():
+    hsg = HuffmanSceneGraph()
+    rebalancer = AdaptiveRebalancer(hsg)
     
-    hsg.rebalance()
+    hsg.add_node("node_a", "test", parent_id="SCENE_ROOT")
+    node_a = hsg.get_node("node_a")
     
-    # Background weight should increase
-    bg_node = hsg.find_node("bg")
-    assert bg_node.weight > 0.3
-    assert bg_node.edit_count == 3
+    initial_weight = node_a.weight
+    
+    # Simulate multiple edits
+    rebalancer.update_weights(["node_a"])
+    rebalancer.update_weights(["node_a"])
+    
+    # Weight should increase due to edits
+    assert node_a.weight > initial_weight

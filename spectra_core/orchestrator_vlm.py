@@ -353,20 +353,22 @@ class OrchestratorVLM:
     def _analyze_local(self, image_pil: Image.Image) -> Dict[str, Any]:
         """
         Build HSG from local CLIPSeg segmentation + simple feature extraction.
-        Returns the same schema as the Gemini path.
+        Returns the same schema as the Gemini path, plus 'masks' dict.
         """
         img = self._prepare_image(image_pil, max_dim=512)
         W, H = img.size
 
         semantic_nodes: List[Dict[str, Any]] = []
+        masks_cache: Dict[str, Any] = {}
 
         if _CLIPSEG_AVAILABLE:
-            semantic_nodes = self._run_clipseg(img, H, W)
+            semantic_nodes, masks_cache = self._run_clipseg(img, H, W)
 
         hsg = self._build_local_hsg(img, semantic_nodes, H, W)
 
         return {
             "hsg": hsg,
+            "masks": masks_cache,      # node_id -> [1,1,H,W] float tensor
             "metadata": {
                 "source": "local_clipseg",
                 "detected_objects_count": len(semantic_nodes),
@@ -383,22 +385,34 @@ class OrchestratorVLM:
             return []
 
         try:
-            # Let the processor handle resizing, but force 224x224 if it defaults to 352
-            inputs = self._clipseg_processor(
+            import torchvision.transforms.functional as _TF
+
+            # DEFINITIVE FIX: Bypass processor's image-resize path entirely.
+            # The rd64-refined variant processor defaults to 352x352, but the
+            # downloaded model weights expect 224x224.  We manually resize +
+            # normalise the image, then only use the processor for text tokens.
+            CLIP_SIZE = 224
+            resized_img = img.resize((CLIP_SIZE, CLIP_SIZE), Image.LANCZOS)
+            pixel_t = _TF.to_tensor(resized_img).to(self.device)  # [3, 224, 224]
+
+            # CLIP canonical normalisation
+            mean = torch.tensor([0.48145466, 0.4578275,  0.40821073], device=self.device)
+            std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device)
+            pixel_t = (pixel_t - mean[:, None, None]) / std[:, None, None]
+
+            # Stack N copies for each text prompt → [N, 3, 224, 224]
+            pixel_values = pixel_t.unsqueeze(0).repeat(len(self.SEMANTIC_PROMPTS), 1, 1, 1)
+
+            # Use processor only for text tokenisation (no image involved)
+            text_inputs = self._clipseg_processor(
                 text=self.SEMANTIC_PROMPTS,
-                images=[img] * len(self.SEMANTIC_PROMPTS),
                 padding=True,
                 return_tensors="pt",
-            )
-            
-            if inputs.pixel_values.shape[-1] != 224:
-                # Force resize to 224 if the processor defaults to 352 but model wants 224
-                inputs.pixel_values = F.interpolate(
-                    inputs.pixel_values, size=(224, 224), 
-                    mode="bilinear", align_corners=False
-                )
-            
-            inputs = inputs.to(self.device)
+            ).to(self.device)
+
+            inputs = {"pixel_values": pixel_values,
+                      **{k: v for k, v in text_inputs.items()
+                         if k != "pixel_values"}}
 
             with torch.no_grad():
                 outputs = self._clipseg_model(**inputs)
@@ -410,9 +424,11 @@ class OrchestratorVLM:
 
             total_px = float(H * W)
             nodes: List[Dict[str, Any]] = []
+            masks_cache: Dict[str, Any] = {}  # node_id -> [1,1,H,W] float tensor
 
             for idx, label in enumerate(self.SEMANTIC_PROMPTS):
-                mask = (preds[idx, 0] > 0.25).float()
+                raw_mask = preds[idx, 0]           # [H, W]
+                mask = (raw_mask > 0.25).float()
                 coverage = float(mask.sum()) / total_px
                 if coverage < 0.01:
                     continue
@@ -430,8 +446,9 @@ class OrchestratorVLM:
                 primary_hex = "#{:02x}{:02x}{:02x}".format(*avg_rgb)
 
                 weight = min(1.0, 0.3 + coverage * 1.4)
+                node_id = f"semantic_{label.replace(' ', '_')}"
                 nodes.append({
-                    "id": f"semantic_{label.replace(' ', '_')}",
+                    "id": node_id,
                     "label": label,
                     "weight": round(weight, 4),
                     "depth": 1,
@@ -444,10 +461,16 @@ class OrchestratorVLM:
                     },
                     "children": [],
                 })
+                # Store 4-D mask tensor for direct use in Stage 3
+                masks_cache[node_id] = mask.unsqueeze(0).unsqueeze(0).cpu()  # [1,1,H,W]
 
-            return nodes
+            return nodes, masks_cache
+        except Exception as e:
+            print(f"[Stage1] CLIPSeg inference failed: {e}")
+            return [], {}
         finally:
             self._unload_clipseg()
+
 
     def _build_local_hsg(
         self,

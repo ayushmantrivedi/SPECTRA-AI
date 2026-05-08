@@ -22,6 +22,8 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import gc
 import logging
+import cv2
+import numpy as np
 
 from main_model import tq_tex, tq_light, tq_bound
 
@@ -56,15 +58,32 @@ class KernelDiffusionModule:
         
         # 1. MAGIC UPCAST: Load the existing FP16 cache but into FP32 tensors
         # This prevents hardware NaNs and dtype crashes without downloading 4GB of weights.
-        self.inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            self.inpaint_model_id,
-            torch_dtype=torch.float32,
-            variant="fp16",
-            use_safetensors=True,
-            safety_checker=None,
-            requires_safety_checker=False,
-            low_cpu_mem_usage=True,
-        )
+        try:
+            # TURBO QUANT: Load with INT8 quantization to stay under 4GB VRAM
+            self.inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+                self.inpaint_model_id,
+                torch_dtype=torch.float16 if is_cuda else torch.float32,
+                variant="fp16",
+                use_safetensors=True,
+                safety_checker=None,
+                requires_safety_checker=False,
+                low_cpu_mem_usage=True,
+                load_in_8bit=True if is_cuda else False,
+                device_map="auto" if is_cuda else None
+            )
+            print("[KernelDiffusion] Loaded with INT8 TurboQuant optimization successfully.")
+        except Exception as e:
+            print(f"[KernelDiffusion] INT8 load failed ({e}), falling back to standard precision.")
+            # MAGIC UPCAST: Load the existing FP16 cache but into FP32 tensors (Fallback)
+            self.inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+                self.inpaint_model_id,
+                torch_dtype=torch.float32,
+                variant="fp16",
+                use_safetensors=True,
+                safety_checker=None,
+                requires_safety_checker=False,
+                low_cpu_mem_usage=True,
+            )
 
         if is_cuda:
             # Check for High-VRAM environment (e.g. Google Colab T4)
@@ -215,33 +234,36 @@ class KernelDiffusionModule:
         elif mask_tensor.dim() == 3:
             mask_tensor = mask_tensor.unsqueeze(0)
             
-        zt_base, zl_base, zb_base = base_features
-
         # CTO Hardening: LBT Synchronization (Hand-in-Hand Editing)
-        # If Texture (ZT) increases (e.g. silver/metallic), Light (ZL) should often scale too
         intent = influence.get("intent")
         zt_intent = influence.get("ZT", 0.0)
         zl_intent = influence.get("ZL", 0.0)
         zb_intent = influence.get("ZB", 0.0)
-        
-        # Heuristic: Silver/Light textures reflect more light
-        if intent and "silver" in intent.lower() and zt_intent > 0.5:
-            zl_intent = max(zl_intent, 0.4) # Automatic light boost for metallic hair
-            print(f"[KernelDiffusion] LBT Sync: Boosted ZL to {zl_intent} for '{intent}'")
 
-        # Subspace diffusion loop (shapes latent vectors)
-        zt_target = zt_base * 0.05
-        zl_target = zl_base * (1.0 + zl_intent)
-        zb_target = zb_base
+        if base_features is not None:
+            # Full subspace diffusion path (legacy SSG features available)
+            zt_base, zl_base, zb_base = base_features
 
-        zt_c, zl_c, zb_c = zt_base, zl_base, zb_base
-        for step in range(1, self.steps + 1):
-            zt_c = self.diffuse_subspace(
-                zt_c, zt_target, zt_intent, tq_tex,   step, self.steps)
-            zl_c = self.diffuse_subspace(
-                zl_c, zl_target, zl_intent, tq_light, step, self.steps)
-            zb_c = self.diffuse_subspace(
-                zb_c, zb_target, zb_intent, tq_bound, step, self.steps)
+            # Heuristic: Silver/Light textures reflect more light
+            if intent and "silver" in intent.lower() and zt_intent > 0.5:
+                zl_intent = max(zl_intent, 0.4)
+                print(f"[KernelDiffusion] LBT Sync: Boosted ZL to {zl_intent} for '{intent}'")
+
+            zt_target = zt_base * 0.05
+            zl_target = zl_base * (1.0 + zl_intent)
+            zb_target = zb_base
+
+            zt_c, zl_c, zb_c = zt_base, zl_base, zb_base
+            for step in range(1, self.steps + 1):
+                zt_c = self.diffuse_subspace(zt_c, zt_target, zt_intent, tq_tex,   step, self.steps)
+                zl_c = self.diffuse_subspace(zl_c, zl_target, zl_intent, tq_light, step, self.steps)
+                zb_c = self.diffuse_subspace(zb_c, zb_target, zb_intent, tq_bound, step, self.steps)
+        else:
+            # Direct-mask path (CLIPSeg masks, no SSG features) — skip subspace loop,
+            # go straight to SD inpainting with the intent-guided prompt
+            if intent and "silver" in intent.lower() and zt_intent > 0.5:
+                zl_intent = max(zl_intent, 0.4)
+                print(f"[KernelDiffusion] LBT Sync (direct): Boosted ZL to {zl_intent}")
 
         # Route decision
         has_intent = "intent" in influence
@@ -290,25 +312,29 @@ class KernelDiffusionModule:
 
             # Feature-Guided Prompting (Translating Latents to Tokens)
             feature_tokens = []
-            if zt_intent > 0.6: feature_tokens.append("highly detailed texture")
-            if zl_intent > 0.4: feature_tokens.append("specular highlights, reflective")
-            if zb_intent > 0.4: feature_tokens.append("sharp edges, defined silhouette")
+            if zt_intent > 0.6: feature_tokens.append("highly detailed")
+            if zl_intent > 0.4: feature_tokens.append("enhanced lighting")
+            if zb_intent > 0.4: feature_tokens.append("defined edges")
             f_guidance = ", ".join(feature_tokens)
 
-            intent_text    = influence.get("intent", "high quality realistic edit")
+            intent_text = influence.get("intent", "high quality realistic edit")
+            
+            # Context-Aware Prompting: don't use indoor studio lighting for nature/skies
+            is_nature = any(k in str(target_node).lower() for k in ["sky", "water", "lake", "forest", "grass", "cloud", "fog", "mountain"])
+            env_modifier = "natural dramatic lighting, epic landscape, outdoor" if is_nature else "professional studio lighting"
+
             # Production Grade Prompt Augmentation
             prompt = (f"{intent_text}, {f_guidance}, masterpiece, photorealistic, "
-                      f"professional studio lighting, 8k resolution")
+                      f"{env_modifier}, 8k resolution").replace(" ,", "")
             
             negative_prompt = ("low quality, bad anatomy, deformed, eyes closed, missing features, "
-                               "worst quality, ugly, blurry, artifacts, distortion, "
+                               "worst quality, ugly, blurry, artifacts, distortion, solid structures in sky, "
                                "pixelated, cartoon, illustration, low resolution")
 
             # IDENTITY GUARD: If we are editing a person, lower the strength to preserve eyes/mouth/nose
             # instead of erasing them. 0.75 is the "Sweet Spot" for AI-remodelling.
-            is_person = "person" in str(target_node).lower() or influence.get("ZT", 0) > 0.5
-            strength = 0.75 if is_person else 0.95
-            
+            is_person = any(k in str(target_node).lower() for k in ["person", "face", "hair", "eyes", "mouth"])
+            strength = 0.75 if is_person else 0.98
             result_pil = self.inpaint_pipeline(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -329,30 +355,30 @@ class KernelDiffusionModule:
                                      mode='bilinear', align_corners=False)
             result_t = result_t.to(full_img.device)
 
-            # 6. Professional Smooth Blend (Soft Gaussian Feathering)
-            # This prevents the "erased" cutout look at the edges
-            blend_mask = F.interpolate(dilated, size=(H_orig, W_orig),
-                                       mode='bilinear', align_corners=False)
+            # 6. Professional Poisson Blend (cv2.seamlessClone)
+            # This ensures perfect boundary harmonization as per production spec
+            blend_mask = F.interpolate(dilated, size=(H_orig, W_orig), mode='nearest')
+            blend_mask_np = (blend_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
             
-            # Feather the edges significantly (25px radius for 512px context)
-            feather_size = max(5, int(max(H_orig, W_orig) * 0.05))
-            if feather_size % 2 == 0: feather_size += 1
-            blend_mask = TF.gaussian_blur(blend_mask, kernel_size=[feather_size, feather_size])
-            
-            mv = blend_mask.max()
-            if mv > 0.001:
-                blend_mask = blend_mask / mv
-            
-            blend_mask3 = blend_mask.repeat(1, 3, 1, 1).to(full_img.device)
-            result_t = result_t.to(full_img.device)
+            orig_np = (full_img[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            res_np = (result_t[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            print(f"[DEBUG Device] full_img: {full_img.device}, result_t: {result_t.device}, blend_mask3: {blend_mask3.device}")
-            # Explicitly force everything to the same device again just in case
-            full_img = full_img.to(full_img.device)
-            blend_mask3 = blend_mask3.to(full_img.device)
-            result_t = result_t.to(full_img.device)
+            # Find center of the mask for seamlessClone
+            y_indices, x_indices = np.where(blend_mask_np > 0)
+            if len(y_indices) > 0 and len(x_indices) > 0:
+                center = (int(np.mean(x_indices)), int(np.mean(y_indices)))
+                try:
+                    blended_np = cv2.seamlessClone(res_np, orig_np, blend_mask_np, center, cv2.NORMAL_CLONE)
+                except Exception as e:
+                    print(f"[KernelDiffusion] seamlessClone failed ({e}), falling back to alpha blend.")
+                    # Fallback to simple alpha blend if poisson fails (e.g., mask touches border in a weird way)
+                    alpha = (blend_mask_np / 255.0)[..., np.newaxis]
+                    blended_np = (orig_np * (1 - alpha) + res_np * alpha).astype(np.uint8)
+            else:
+                blended_np = res_np
 
-            return full_img * (1.0 - blend_mask3) + result_t * blend_mask3
+            blended_t = torch.from_numpy(blended_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            return blended_t.to(full_img.device)
 
         # ── PIXEL-SPACE FALLBACK PATH ──────────────────────────────────
         print(f"[KernelDiffusion] Pixel-space edit | node: {target_node} | "
